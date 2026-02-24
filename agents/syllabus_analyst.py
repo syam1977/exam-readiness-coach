@@ -3,19 +3,11 @@ Syllabus Analyst Agent
 Microsoft認定試験のシラバスを解析し、学習ドメイン・キーサービス・優先トピックを抽出する。
 """
 
-import json
 import os
-import re
 from dataclasses import dataclass, field
 from typing import Optional
 
-from azure.ai.agents.models import (
-    AgentThreadCreationOptions,
-    MessageRole,
-    ThreadMessageOptions,
-)
-from azure.ai.projects import AIProjectClient
-from azure.identity import DefaultAzureCredential
+from agents.base import extract_json, run_agent
 
 _SYSTEM_INSTRUCTIONS = """\
 You are a Syllabus Analyst specializing in Microsoft certification exams.
@@ -91,12 +83,6 @@ def _build_user_message(req: ExamRequest) -> str:
     return "\n".join(parts)
 
 
-def _extract_json(text: str) -> dict:
-    match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
-    json_text = match.group(1) if match else text
-    return json.loads(json_text.strip())
-
-
 def analyze_syllabus(req: ExamRequest) -> SyllabusResult:
     """
     試験シラバスを解析し、ドメイン・キーサービス・重要トピックを返す。
@@ -107,66 +93,29 @@ def analyze_syllabus(req: ExamRequest) -> SyllabusResult:
     Returns:
         SyllabusResult: ドメイン構成・重要サービス・用語注意点を含む解析結果
     """
-    endpoint = os.environ["AZURE_AI_PROJECT_ENDPOINT"]
-    model = os.environ["AZURE_AI_MODEL_DEPLOYMENT"]
-
-    with AIProjectClient(
-        endpoint=endpoint,
-        credential=DefaultAzureCredential(),
-    ) as project_client:
-        agent = project_client.agents.create_agent(
-            model=model,
-            name="syllabus-analyst",
-            instructions=_SYSTEM_INSTRUCTIONS,
+    raw_text = run_agent(
+        endpoint=os.environ["AZURE_AI_PROJECT_ENDPOINT"],
+        model=os.environ["AZURE_AI_MODEL_DEPLOYMENT"],
+        agent_name="syllabus-analyst",
+        instructions=_SYSTEM_INSTRUCTIONS,
+        user_message=_build_user_message(req),
+    )
+    parsed = extract_json(raw_text)
+    domains = [
+        Domain(
+            name=d.get("name", ""),
+            weight_percent=d.get("weight_percent", 0),
+            key_topics=d.get("key_topics", []),
         )
-        try:
-            run = project_client.agents.create_thread_and_process_run(
-                agent_id=agent.id,
-                thread=AgentThreadCreationOptions(
-                    messages=[
-                        ThreadMessageOptions(
-                            role=MessageRole.USER,
-                            content=_build_user_message(req),
-                        )
-                    ]
-                ),
-            )
-
-            messages = list(
-                project_client.agents.messages.list(thread_id=run.thread_id)
-            )
-
-            assistant_message = next(
-                (m for m in messages if m.role == MessageRole.AGENT),
-                None,
-            )
-            if assistant_message is None:
-                raise RuntimeError(
-                    f"エージェントからの応答が見つかりません。Run status: {run.status}"
-                )
-
-            raw_text = "\n".join(
-                tc.text.value for tc in assistant_message.text_messages
-            )
-
-            parsed = _extract_json(raw_text)
-            domains = [
-                Domain(
-                    name=d.get("name", ""),
-                    weight_percent=d.get("weight_percent", 0),
-                    key_topics=d.get("key_topics", []),
-                )
-                for d in parsed.get("domains", [])
-            ]
-            return SyllabusResult(
-                exam_code=parsed.get("exam_code", req.exam_code),
-                exam_title=parsed.get("exam_title", ""),
-                domains=domains,
-                key_services=parsed.get("key_services", []),
-                high_frequency_topics=parsed.get("high_frequency_topics", []),
-                terminology_watch=parsed.get("terminology_watch", []),
-                total_topics_count=parsed.get("total_topics_count", 0),
-                raw_response=raw_text,
-            )
-        finally:
-            project_client.agents.delete_agent(agent.id)
+        for d in parsed.get("domains", [])
+    ]
+    return SyllabusResult(
+        exam_code=parsed.get("exam_code", req.exam_code),
+        exam_title=parsed.get("exam_title", ""),
+        domains=domains,
+        key_services=parsed.get("key_services", []),
+        high_frequency_topics=parsed.get("high_frequency_topics", []),
+        terminology_watch=parsed.get("terminology_watch", []),
+        total_topics_count=parsed.get("total_topics_count", 0),
+        raw_response=raw_text,
+    )

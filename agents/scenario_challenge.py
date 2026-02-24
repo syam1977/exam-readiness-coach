@@ -3,18 +3,10 @@ Scenario Challenge Agent
 学習計画のドメイン・トピックに基づき、実務シナリオ型の問題を生成する。
 """
 
-import json
 import os
-import re
 from dataclasses import dataclass, field
 
-from azure.ai.agents.models import (
-    AgentThreadCreationOptions,
-    MessageRole,
-    ThreadMessageOptions,
-)
-from azure.ai.projects import AIProjectClient
-from azure.identity import DefaultAzureCredential
+from agents.base import extract_json, run_agent
 
 _SYSTEM_INSTRUCTIONS = """\
 You are a Scenario Challenge Generator for Microsoft certification exam preparation.
@@ -103,12 +95,6 @@ def _build_user_message(req: ChallengeRequest) -> str:
     return "\n".join(parts)
 
 
-def _extract_json(text: str) -> dict:
-    match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
-    json_text = match.group(1) if match else text
-    return json.loads(json_text.strip())
-
-
 def generate_challenge(req: ChallengeRequest) -> ChallengeScenario:
     """
     指定ドメインのシナリオ型試験問題を生成する。
@@ -119,61 +105,24 @@ def generate_challenge(req: ChallengeRequest) -> ChallengeScenario:
     Returns:
         ChallengeScenario: 問題文・選択肢・正解・解説を含むシナリオ問題
     """
-    endpoint = os.environ["AZURE_AI_PROJECT_ENDPOINT"]
-    model = os.environ["AZURE_AI_MODEL_DEPLOYMENT"]
-
-    with AIProjectClient(
-        endpoint=endpoint,
-        credential=DefaultAzureCredential(),
-    ) as project_client:
-        agent = project_client.agents.create_agent(
-            model=model,
-            name="scenario-challenge",
-            instructions=_SYSTEM_INSTRUCTIONS,
-        )
-        try:
-            run = project_client.agents.create_thread_and_process_run(
-                agent_id=agent.id,
-                thread=AgentThreadCreationOptions(
-                    messages=[
-                        ThreadMessageOptions(
-                            role=MessageRole.USER,
-                            content=_build_user_message(req),
-                        )
-                    ]
-                ),
-            )
-
-            messages = list(
-                project_client.agents.messages.list(thread_id=run.thread_id)
-            )
-
-            assistant_message = next(
-                (m for m in messages if m.role == MessageRole.AGENT),
-                None,
-            )
-            if assistant_message is None:
-                raise RuntimeError(
-                    f"エージェントからの応答が見つかりません。Run status: {run.status}"
-                )
-
-            raw_text = "\n".join(
-                tc.text.value for tc in assistant_message.text_messages
-            )
-
-            parsed = _extract_json(raw_text)
-            return ChallengeScenario(
-                domain=parsed.get("domain", req.domain),
-                topic=parsed.get("topic", req.topic),
-                difficulty=parsed.get("difficulty", req.difficulty),
-                scenario=parsed.get("scenario", ""),
-                question=parsed.get("question", ""),
-                options=parsed.get("options", {}),
-                correct_answer=parsed.get("correct_answer", ""),
-                correct_answer_text=parsed.get("correct_answer_text", ""),
-                explanation=parsed.get("explanation", ""),
-                trap=parsed.get("trap", ""),
-                raw_response=raw_text,
-            )
-        finally:
-            project_client.agents.delete_agent(agent.id)
+    raw_text = run_agent(
+        endpoint=os.environ["AZURE_AI_PROJECT_ENDPOINT"],
+        model=os.environ["AZURE_AI_MODEL_DEPLOYMENT"],
+        agent_name="scenario-challenge",
+        instructions=_SYSTEM_INSTRUCTIONS,
+        user_message=_build_user_message(req),
+    )
+    parsed = extract_json(raw_text)
+    return ChallengeScenario(
+        domain=parsed.get("domain", req.domain),
+        topic=parsed.get("topic", req.topic),
+        difficulty=parsed.get("difficulty", req.difficulty),
+        scenario=parsed.get("scenario", ""),
+        question=parsed.get("question", ""),
+        options=parsed.get("options", {}),
+        correct_answer=parsed.get("correct_answer", ""),
+        correct_answer_text=parsed.get("correct_answer_text", ""),
+        explanation=parsed.get("explanation", ""),
+        trap=parsed.get("trap", ""),
+        raw_response=raw_text,
+    )

@@ -3,19 +3,10 @@ Adaptive Coach Agent
 診断結果・問題シナリオ・学習計画を統合し、個別最適化されたフィードバックと次のステップを提示する。
 """
 
-import json
 import os
-import re
 from dataclasses import dataclass, field
 
-from azure.ai.agents.models import (
-    AgentThreadCreationOptions,
-    MessageRole,
-    ThreadMessageOptions,
-)
-from azure.ai.projects import AIProjectClient
-from azure.identity import DefaultAzureCredential
-
+from agents.base import extract_json, run_agent
 from agents.reasoning_analyzer import DiagnosisResult
 from agents.scenario_challenge import ChallengeScenario
 from agents.study_planner import StudyPlan
@@ -134,12 +125,6 @@ Daily Focus: {inp.study_plan.daily_focus}
 Provide personalized adaptive coaching feedback."""
 
 
-def _extract_json(text: str) -> dict:
-    match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
-    json_text = match.group(1) if match else text
-    return json.loads(json_text.strip())
-
-
 def coach(inp: CoachInput) -> CoachFeedback:
     """
     診断結果・問題シナリオ・学習計画を統合し、個別最適化フィードバックを返す。
@@ -150,67 +135,30 @@ def coach(inp: CoachInput) -> CoachFeedback:
     Returns:
         CoachFeedback: 励まし・即時アクション・次のステップ・自信度アドバイス
     """
-    endpoint = os.environ["AZURE_AI_PROJECT_ENDPOINT"]
-    model = os.environ["AZURE_AI_MODEL_DEPLOYMENT"]
-
-    with AIProjectClient(
-        endpoint=endpoint,
-        credential=DefaultAzureCredential(),
-    ) as project_client:
-        agent = project_client.agents.create_agent(
-            model=model,
-            name="adaptive-coach",
-            instructions=_SYSTEM_INSTRUCTIONS,
+    raw_text = run_agent(
+        endpoint=os.environ["AZURE_AI_PROJECT_ENDPOINT"],
+        model=os.environ["AZURE_AI_MODEL_DEPLOYMENT"],
+        agent_name="adaptive-coach",
+        instructions=_SYSTEM_INSTRUCTIONS,
+        user_message=_build_user_message(inp),
+    )
+    parsed = extract_json(raw_text)
+    next_actions = [
+        NextAction(
+            priority=a.get("priority", i + 1),
+            action=a.get("action", ""),
+            resource=a.get("resource"),
+            time_estimate=a.get("time_estimate", ""),
         )
-        try:
-            run = project_client.agents.create_thread_and_process_run(
-                agent_id=agent.id,
-                thread=AgentThreadCreationOptions(
-                    messages=[
-                        ThreadMessageOptions(
-                            role=MessageRole.USER,
-                            content=_build_user_message(inp),
-                        )
-                    ]
-                ),
-            )
-
-            messages = list(
-                project_client.agents.messages.list(thread_id=run.thread_id)
-            )
-
-            assistant_message = next(
-                (m for m in messages if m.role == MessageRole.AGENT),
-                None,
-            )
-            if assistant_message is None:
-                raise RuntimeError(
-                    f"エージェントからの応答が見つかりません。Run status: {run.status}"
-                )
-
-            raw_text = "\n".join(
-                tc.text.value for tc in assistant_message.text_messages
-            )
-
-            parsed = _extract_json(raw_text)
-            next_actions = [
-                NextAction(
-                    priority=a.get("priority", i + 1),
-                    action=a.get("action", ""),
-                    resource=a.get("resource"),
-                    time_estimate=a.get("time_estimate", ""),
-                )
-                for i, a in enumerate(parsed.get("next_actions", []))
-            ]
-            return CoachFeedback(
-                encouragement=parsed.get("encouragement", ""),
-                root_cause_summary=parsed.get("root_cause_summary", ""),
-                immediate_action=parsed.get("immediate_action", ""),
-                next_actions=next_actions,
-                review_topics=parsed.get("review_topics", []),
-                confidence_tip=parsed.get("confidence_tip", ""),
-                progress_note=parsed.get("progress_note", ""),
-                raw_response=raw_text,
-            )
-        finally:
-            project_client.agents.delete_agent(agent.id)
+        for i, a in enumerate(parsed.get("next_actions", []))
+    ]
+    return CoachFeedback(
+        encouragement=parsed.get("encouragement", ""),
+        root_cause_summary=parsed.get("root_cause_summary", ""),
+        immediate_action=parsed.get("immediate_action", ""),
+        next_actions=next_actions,
+        review_topics=parsed.get("review_topics", []),
+        confidence_tip=parsed.get("confidence_tip", ""),
+        progress_note=parsed.get("progress_note", ""),
+        raw_response=raw_text,
+    )

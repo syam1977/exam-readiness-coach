@@ -3,20 +3,11 @@ Study Planner Agent
 シラバス解析結果と学習者プロファイルをもとに、優先度付きの学習計画を立案する。
 """
 
-import json
 import os
-import re
 from dataclasses import dataclass, field
 from typing import Optional
 
-from azure.ai.agents.models import (
-    AgentThreadCreationOptions,
-    MessageRole,
-    ThreadMessageOptions,
-)
-from azure.ai.projects import AIProjectClient
-from azure.identity import DefaultAzureCredential
-
+from agents.base import extract_json, run_agent
 from agents.syllabus_analyst import SyllabusResult
 
 _SYSTEM_INSTRUCTIONS = """\
@@ -128,12 +119,6 @@ def _build_user_message(inp: PlanningInput) -> str:
     return "\n".join(parts)
 
 
-def _extract_json(text: str) -> dict:
-    match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
-    json_text = match.group(1) if match else text
-    return json.loads(json_text.strip())
-
-
 def create_study_plan(inp: PlanningInput) -> StudyPlan:
     """
     シラバスと学習者情報をもとに優先度付き学習計画を作成する。
@@ -144,69 +129,32 @@ def create_study_plan(inp: PlanningInput) -> StudyPlan:
     Returns:
         StudyPlan: 優先ドメイン・弱点エリア・日々のアドバイスを含む学習計画
     """
-    endpoint = os.environ["AZURE_AI_PROJECT_ENDPOINT"]
-    model = os.environ["AZURE_AI_MODEL_DEPLOYMENT"]
-
-    with AIProjectClient(
-        endpoint=endpoint,
-        credential=DefaultAzureCredential(),
-    ) as project_client:
-        agent = project_client.agents.create_agent(
-            model=model,
-            name="study-planner",
-            instructions=_SYSTEM_INSTRUCTIONS,
+    raw_text = run_agent(
+        endpoint=os.environ["AZURE_AI_PROJECT_ENDPOINT"],
+        model=os.environ["AZURE_AI_MODEL_DEPLOYMENT"],
+        agent_name="study-planner",
+        instructions=_SYSTEM_INSTRUCTIONS,
+        user_message=_build_user_message(inp),
+    )
+    parsed = extract_json(raw_text)
+    priorities = [
+        StudyPriority(
+            rank=p.get("rank", i + 1),
+            domain=p.get("domain", ""),
+            reason=p.get("reason", ""),
+            estimated_hours=p.get("estimated_hours", 0),
+            bias_risk=p.get("bias_risk", "None"),
+            bias_detail=p.get("bias_detail"),
         )
-        try:
-            run = project_client.agents.create_thread_and_process_run(
-                agent_id=agent.id,
-                thread=AgentThreadCreationOptions(
-                    messages=[
-                        ThreadMessageOptions(
-                            role=MessageRole.USER,
-                            content=_build_user_message(inp),
-                        )
-                    ]
-                ),
-            )
-
-            messages = list(
-                project_client.agents.messages.list(thread_id=run.thread_id)
-            )
-
-            assistant_message = next(
-                (m for m in messages if m.role == MessageRole.AGENT),
-                None,
-            )
-            if assistant_message is None:
-                raise RuntimeError(
-                    f"エージェントからの応答が見つかりません。Run status: {run.status}"
-                )
-
-            raw_text = "\n".join(
-                tc.text.value for tc in assistant_message.text_messages
-            )
-
-            parsed = _extract_json(raw_text)
-            priorities = [
-                StudyPriority(
-                    rank=p.get("rank", i + 1),
-                    domain=p.get("domain", ""),
-                    reason=p.get("reason", ""),
-                    estimated_hours=p.get("estimated_hours", 0),
-                    bias_risk=p.get("bias_risk", "None"),
-                    bias_detail=p.get("bias_detail"),
-                )
-                for i, p in enumerate(parsed.get("study_priorities", []))
-            ]
-            return StudyPlan(
-                total_weeks=parsed.get("total_weeks", inp.available_weeks),
-                weekly_hours=parsed.get("weekly_hours", inp.hours_per_week),
-                study_priorities=priorities,
-                weak_areas=parsed.get("weak_areas", []),
-                quick_wins=parsed.get("quick_wins", []),
-                daily_focus=parsed.get("daily_focus", ""),
-                terminology_priorities=parsed.get("terminology_priorities", []),
-                raw_response=raw_text,
-            )
-        finally:
-            project_client.agents.delete_agent(agent.id)
+        for i, p in enumerate(parsed.get("study_priorities", []))
+    ]
+    return StudyPlan(
+        total_weeks=parsed.get("total_weeks", inp.available_weeks),
+        weekly_hours=parsed.get("weekly_hours", inp.hours_per_week),
+        study_priorities=priorities,
+        weak_areas=parsed.get("weak_areas", []),
+        quick_wins=parsed.get("quick_wins", []),
+        daily_focus=parsed.get("daily_focus", ""),
+        terminology_priorities=parsed.get("terminology_priorities", []),
+        raw_response=raw_text,
+    )
