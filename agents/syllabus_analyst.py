@@ -1,0 +1,172 @@
+"""
+Syllabus Analyst Agent
+Microsoft認定試験のシラバスを解析し、学習ドメイン・キーサービス・優先トピックを抽出する。
+"""
+
+import json
+import os
+import re
+from dataclasses import dataclass, field
+from typing import Optional
+
+from azure.ai.agents.models import (
+    AgentThreadCreationOptions,
+    MessageRole,
+    ThreadMessageOptions,
+)
+from azure.ai.projects import AIProjectClient
+from azure.identity import DefaultAzureCredential
+
+_SYSTEM_INSTRUCTIONS = """\
+You are a Syllabus Analyst specializing in Microsoft certification exams.
+
+Your job is to analyze the given exam code and extract structured information about:
+- The main skill domains and their percentage weights
+- Key Azure services and technologies covered
+- Critical topics that frequently appear in exam questions
+- Recommended study focus areas
+
+## Output Format
+Respond ONLY with valid JSON in this exact structure:
+```json
+{
+  "exam_code": "<exam code, e.g. AZ-104>",
+  "exam_title": "<full exam title>",
+  "domains": [
+    {
+      "name": "<domain name>",
+      "weight_percent": <integer 0-100>,
+      "key_topics": ["<topic1>", "<topic2>", "..."]
+    }
+  ],
+  "key_services": ["<service1>", "<service2>", "..."],
+  "high_frequency_topics": ["<topic1>", "<topic2>", "..."],
+  "terminology_watch": ["<old_name> → <new_name>", "..."],
+  "total_topics_count": <integer>
+}
+```
+
+Focus on the most current version of the exam (as of 2025-2026).
+Include terminology_watch entries for services that have been renamed recently
+(e.g., Azure AD → Microsoft Entra ID).
+Do not include any text outside the JSON block.
+"""
+
+
+@dataclass
+class ExamRequest:
+    """シラバス解析のリクエスト。"""
+    exam_code: str  # e.g. "AZ-104", "AZ-900", "SC-900"
+    learner_background: Optional[str] = None
+
+
+@dataclass
+class Domain:
+    """試験ドメイン情報。"""
+    name: str
+    weight_percent: int
+    key_topics: list[str]
+
+
+@dataclass
+class SyllabusResult:
+    """シラバス解析結果。"""
+    exam_code: str
+    exam_title: str
+    domains: list[Domain]
+    key_services: list[str]
+    high_frequency_topics: list[str]
+    terminology_watch: list[str]
+    total_topics_count: int
+    raw_response: str = field(repr=False, default="")
+
+
+def _build_user_message(req: ExamRequest) -> str:
+    parts = [f"Exam Code: {req.exam_code}"]
+    if req.learner_background:
+        parts.append(f"Learner Background: {req.learner_background}")
+    parts.append(
+        "Please analyze this exam's syllabus and provide the structured breakdown."
+    )
+    return "\n".join(parts)
+
+
+def _extract_json(text: str) -> dict:
+    match = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+    json_text = match.group(1) if match else text
+    return json.loads(json_text.strip())
+
+
+def analyze_syllabus(req: ExamRequest) -> SyllabusResult:
+    """
+    試験シラバスを解析し、ドメイン・キーサービス・重要トピックを返す。
+
+    Args:
+        req: 試験コードと学習者の背景情報
+
+    Returns:
+        SyllabusResult: ドメイン構成・重要サービス・用語注意点を含む解析結果
+    """
+    endpoint = os.environ["AZURE_AI_PROJECT_ENDPOINT"]
+    model = os.environ["AZURE_AI_MODEL_DEPLOYMENT"]
+
+    with AIProjectClient(
+        endpoint=endpoint,
+        credential=DefaultAzureCredential(),
+    ) as project_client:
+        agent = project_client.agents.create_agent(
+            model=model,
+            name="syllabus-analyst",
+            instructions=_SYSTEM_INSTRUCTIONS,
+        )
+        try:
+            run = project_client.agents.create_thread_and_process_run(
+                agent_id=agent.id,
+                thread=AgentThreadCreationOptions(
+                    messages=[
+                        ThreadMessageOptions(
+                            role=MessageRole.USER,
+                            content=_build_user_message(req),
+                        )
+                    ]
+                ),
+            )
+
+            messages = list(
+                project_client.agents.messages.list(thread_id=run.thread_id)
+            )
+
+            assistant_message = next(
+                (m for m in messages if m.role == MessageRole.AGENT),
+                None,
+            )
+            if assistant_message is None:
+                raise RuntimeError(
+                    f"エージェントからの応答が見つかりません。Run status: {run.status}"
+                )
+
+            raw_text = "\n".join(
+                tc.text.value for tc in assistant_message.text_messages
+            )
+
+            parsed = _extract_json(raw_text)
+            domains = [
+                Domain(
+                    name=d.get("name", ""),
+                    weight_percent=d.get("weight_percent", 0),
+                    key_topics=d.get("key_topics", []),
+                )
+                for d in parsed.get("domains", [])
+            ]
+            return SyllabusResult(
+                exam_code=parsed.get("exam_code", req.exam_code),
+                exam_title=parsed.get("exam_title", ""),
+                domains=domains,
+                key_services=parsed.get("key_services", []),
+                high_frequency_topics=parsed.get("high_frequency_topics", []),
+                terminology_watch=parsed.get("terminology_watch", []),
+                total_topics_count=parsed.get("total_topics_count", 0),
+                raw_response=raw_text,
+            )
+        finally:
+            project_client.agents.delete_agent(agent.id)
